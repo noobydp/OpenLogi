@@ -222,9 +222,8 @@ async fn manage(
                 };
                 dispatch_input(&input.session, input.input, &live_spec, &dispatcher);
             }
-            _ = ticker.tick() => {
-                // While pairing is waiting or active, release the capture
-                // session so run_pairing can own the receiver's HID node.
+            () = wait_for_target_refresh(&mut ticker, &receiver_access) => {
+                // Release capture whenever an exclusive receiver operation is pending.
                 let want = wanted_session(&receiver_access, &spec);
                 if let Some(running) = current.as_mut() {
                     // Stop a session that no longer matches the spec; sending
@@ -304,6 +303,16 @@ async fn manage(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_target_refresh(
+    ticker: &mut tokio::time::Interval,
+    receiver_access: &ReceiverAccess,
+) {
+    tokio::select! {
+        _ = ticker.tick() => {}
+        () = receiver_access.wait_for_exclusive_request_while_idle() => {}
     }
 }
 

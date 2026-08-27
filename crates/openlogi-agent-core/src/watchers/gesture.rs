@@ -289,7 +289,7 @@ async fn manage(
                     debug!(key, epoch = event.session.epoch(), "input from a stale capture session — ignored");
                 }
             }
-            _ = ticker.tick() => {
+            () = wait_for_target_refresh(&mut ticker, &receiver_access) => {
                 // While pairing is waiting or active, release every capture
                 // session so run_pairing can own the receiver's HID node (one
                 // process can't read it through two channels).
@@ -354,6 +354,16 @@ async fn manage(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_target_refresh(
+    ticker: &mut tokio::time::Interval,
+    receiver_access: &ReceiverAccess,
+) {
+    tokio::select! {
+        _ = ticker.tick() => {}
+        () = receiver_access.wait_for_exclusive_request_while_idle() => {}
     }
 }
 

@@ -162,6 +162,8 @@ pub(crate) enum ScriptedNode {
     OpenFails,
     /// The node opens but carries no HID++ collection.
     NotHidpp,
+    /// The node opens into the supplied live scripted HID++ channel.
+    Live(Arc<HidppChannel>),
 }
 
 /// A [`HidBackend`] over scripted nodes.
@@ -201,6 +203,7 @@ impl HidBackend for ScriptedBackend {
         match self.node(&node.id) {
             None | Some(ScriptedNode::OpenFails) => Err(BackendError::Disconnected),
             Some(ScriptedNode::NotHidpp) => Ok(None),
+            Some(ScriptedNode::Live(channel)) => Ok(Some(Arc::clone(channel))),
         }
     }
 

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 /// Coordinates exclusive access to the receiver HID node.
 #[derive(Clone, Default)]
@@ -19,6 +19,7 @@ pub struct ReceiverAccess {
 struct ReceiverAccessInner {
     lease: Arc<RwLock<()>>,
     exclusive_requests: Arc<AtomicU8>,
+    exclusive_notify: Arc<Notify>,
 }
 
 /// Operation requiring sole ownership of a receiver transport.
@@ -63,6 +64,29 @@ impl ReceiverAccess {
         self.inner.exclusive_requests.load(Ordering::Acquire) & reason.bit() != 0
     }
 
+    /// Wait until an exclusive operation asks long-running sessions to stop.
+    async fn wait_for_exclusive_request(&self) {
+        loop {
+            let notified = self.inner.exclusive_notify.notified();
+            if self.exclusive_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Wake a session-manager select only when access is currently idle.
+    ///
+    /// When a request is already active, the manager's parallel refresh timer
+    /// owns reevaluation; this branch deliberately remains pending.
+    pub(crate) async fn wait_for_exclusive_request_while_idle(&self) {
+        if self.exclusive_requested() {
+            std::future::pending::<()>().await;
+        } else {
+            self.wait_for_exclusive_request().await;
+        }
+    }
+
     /// Try to acquire receiver access for a pooled HID++ session.
     ///
     /// Capture is opportunistic: if pairing is waiting or active, capture should
@@ -94,7 +118,11 @@ impl ReceiverAccess {
     /// If the returned future is cancelled while waiting, the pairing request is
     /// withdrawn automatically so capture can resume.
     pub async fn acquire_exclusive(&self, reason: ExclusiveAccessReason) -> ExclusiveReceiverLease {
-        let request = ExclusiveRequest::new(Arc::clone(&self.inner.exclusive_requests), reason);
+        let request = ExclusiveRequest::new(
+            Arc::clone(&self.inner.exclusive_requests),
+            Arc::clone(&self.inner.exclusive_notify),
+            reason,
+        );
         let guard = Arc::clone(&self.inner.lease).write_owned().await;
         ExclusiveReceiverLease {
             _guard: guard,
@@ -105,13 +133,19 @@ impl ReceiverAccess {
 
 struct ExclusiveRequest {
     requests: Arc<AtomicU8>,
+    notify: Arc<Notify>,
     reason: ExclusiveAccessReason,
 }
 
 impl ExclusiveRequest {
-    fn new(requests: Arc<AtomicU8>, reason: ExclusiveAccessReason) -> Self {
+    fn new(requests: Arc<AtomicU8>, notify: Arc<Notify>, reason: ExclusiveAccessReason) -> Self {
         requests.fetch_or(reason.bit(), Ordering::AcqRel);
-        Self { requests, reason }
+        notify.notify_waiters();
+        Self {
+            requests,
+            notify,
+            reason,
+        }
     }
 }
 
@@ -119,6 +153,7 @@ impl Drop for ExclusiveRequest {
     fn drop(&mut self) {
         self.requests
             .fetch_and(!self.reason.bit(), Ordering::AcqRel);
+        self.notify.notify_waiters();
     }
 }
 
@@ -214,5 +249,36 @@ mod tests {
         waiting
             .await
             .expect("bounded io must acquire its lease once the host transition releases");
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_request_wakes_session_managers_immediately() {
+        let access = ReceiverAccess::default();
+        let capture = access
+            .try_acquire_for_session()
+            .expect("capture should hold the shared lease");
+        let waiting_for_notice = tokio::spawn({
+            let access = access.clone();
+            async move { access.wait_for_exclusive_request().await }
+        });
+        let waiting_for_exclusive = tokio::spawn({
+            let access = access.clone();
+            async move {
+                access
+                    .acquire_exclusive(ExclusiveAccessReason::HostTransition)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiting_for_notice)
+            .await
+            .expect("session manager was not notified promptly")
+            .expect("notification task panicked");
+        drop(capture);
+        drop(
+            waiting_for_exclusive
+                .await
+                .expect("exclusive task panicked"),
+        );
     }
 }

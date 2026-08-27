@@ -101,7 +101,7 @@ pub struct SharedRuntime {
     /// Receiver access shared by HID++ sessions and pairing. Pairing/host
     /// transitions are exclusive; capture sessions share under read leases.
     pub receiver_access: ReceiverAccess,
-    /// Keyboard → pointing-device routes resolved from `config.toml`.
+    /// Keyboard → linked-device routes resolved from `config.toml`.
     pub host_switch_links: HostSwitchLinks,
 }
 
@@ -962,7 +962,11 @@ fn host_switch_links(config: &Config, devices: &[AgentDevice]) -> Vec<HostSwitch
                         .and_then(|device| device.route.clone())
                 })
                 .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some(HostSwitchLink { keyboard, targets })
+            (!targets.is_empty()).then_some(HostSwitchLink {
+                keyboard_key: keyboard_key.clone(),
+                keyboard,
+                targets,
+            })
         })
         .collect()
 }

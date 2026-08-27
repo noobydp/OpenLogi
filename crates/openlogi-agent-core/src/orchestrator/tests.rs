@@ -393,6 +393,7 @@ fn host_switch_links_keep_sleeping_targets_but_require_online_keyboard() {
     let links = host_switch_links(&config, &devices);
 
     assert_eq!(links.len(), 1);
+    assert_eq!(links[0].keyboard_key, "keyboard");
     assert_eq!(
         links[0].keyboard,
         DeviceRoute::Bolt {

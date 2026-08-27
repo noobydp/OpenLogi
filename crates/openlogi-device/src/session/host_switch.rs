@@ -1,7 +1,7 @@
 //! Keyboard-initiated host-switch synchronization.
 //!
 //! A session temporarily diverts the keyboard's three host controls, observes
-//! which channel was pressed, switches the linked pointing devices, and then
+//! which channel was pressed, switches the linked devices, and then
 //! switches the keyboard itself. Ordering matters: once the keyboard leaves
 //! this host its HID++ channel can no longer command a mouse sharing the same
 //! receiver.
@@ -10,12 +10,8 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use hidpp::{
     channel::HidppChannel,
-    device::Device,
-    feature::{
-        CreatableFeature,
-        change_host::ChangeHostFeature,
-        hosts_info::{HostIndex, HostSlotStatus, HostsInfoFeature},
-    },
+    device::{Device, DeviceError},
+    feature::{CreatableFeature, change_host::ChangeHostFeature},
     protocol::v20,
 };
 use thiserror::Error;
@@ -31,6 +27,12 @@ use crate::{
     reprog_controls::{self, ReprogControlsV4},
 };
 
+mod transition;
+
+pub use transition::switch_linked_hosts;
+#[cfg(test)]
+use transition::{host_change_required, prepare_host_change_on, shares_channel};
+
 /// Why an armed host-switch session is being stopped externally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostSwitchStopReason {
@@ -40,16 +42,37 @@ pub enum HostSwitchStopReason {
     DeviceLost,
 }
 
-const HOST_CONTROL_IDS: [(reprog_controls::ControlId, u8); 3] = [
-    (reprog_controls::control_ids::HOST_SWITCH_CHANNEL_1, 0),
-    (reprog_controls::control_ids::HOST_SWITCH_CHANNEL_2, 1),
-    (reprog_controls::control_ids::HOST_SWITCH_CHANNEL_3, 2),
-];
-const HOST_TASK_IDS: [(reprog_controls::TaskId, u8); 3] = [
-    (reprog_controls::task_ids::HOST_SWITCH_CHANNEL_1, 0),
-    (reprog_controls::task_ids::HOST_SWITCH_CHANNEL_2, 1),
-    (reprog_controls::task_ids::HOST_SWITCH_CHANNEL_3, 2),
-];
+/// Whether OpenLogi must command the keyboard or its firmware already began
+/// the requested transition after reporting a physical Easy-Switch press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardHostTransition {
+    /// Move linked devices first, then command the keyboard last.
+    CommandRequired,
+    /// The keyboard firmware is already leaving; move linked devices now.
+    AlreadyDeparting,
+}
+
+/// How a host-switch session should observe the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSwitchCaptureMode {
+    /// Discover and arm the keyboard's reportable host controls.
+    Full,
+    /// Resolve ChangeHost and listen only for its departure announcement.
+    ChangeHostAnnouncement,
+}
+
+/// A host-switch request captured from the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSwitchRequest {
+    /// Zero-based destination host slot.
+    pub host: u8,
+    /// How the keyboard itself will reach the destination.
+    pub keyboard_transition: KeyboardHostTransition,
+    /// Whether this request proves that announcement-only capture can be used
+    /// for this physical keyboard on subsequent connections.
+    pub announcement_observed: bool,
+}
+const EASY_SWITCH_HOST_COUNT: u8 = 3;
 const HIDPP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
@@ -81,6 +104,9 @@ pub enum HostSwitchError {
     /// A required HID++ operation failed.
     #[error("HID++ protocol error: {0}")]
     Hidpp(String),
+    /// Opening the addressed HID++ device failed.
+    #[error("HID++ device error: {0}")]
+    Device(#[from] DeviceError),
     /// A required HID++ operation did not complete within its budget.
     #[error("HID++ operation timed out while {operation}")]
     TimedOut {
@@ -99,29 +125,45 @@ pub enum HostSwitchError {
     },
 }
 
+impl HostSwitchError {
+    /// Whether the error means the keyboard may already have departed after
+    /// reporting an analytics-only host key. Validation failures are not
+    /// departure signals: switching targets after one would strand them.
+    fn is_device_unreachable(&self) -> bool {
+        matches!(
+            self,
+            Self::Hid(BackendError::Disconnected)
+                | Self::KeyboardNotFound
+                | Self::Device(DeviceError::DeviceNotFound)
+        )
+    }
+}
+
 /// Capture host switch keys on `keyboard` until one is pressed or `shutdown`
 /// resolves. Controls are restored before a requested host is returned.
 pub async fn run_host_switch_session(
     keyboard: DeviceRoute,
     shutdown: oneshot::Receiver<HostSwitchStopReason>,
     channel_pool: ChannelPool,
-) -> Result<Option<u8>, HostSwitchError> {
+    capture_mode: HostSwitchCaptureMode,
+) -> Result<Option<HostSwitchRequest>, HostSwitchError> {
     let channel = open_channel(&channel_pool, &keyboard, "opening keyboard channel")
         .await?
         .ok_or(HostSwitchError::KeyboardNotFound)?;
     let keyboard_index = keyboard.device_index();
-    let device = timed_hidpp(
-        "opening keyboard device",
-        Device::new(Arc::clone(&channel), keyboard_index),
-    )
-    .await?;
-    let feature = timed_hidpp(
-        "locating host controls",
-        device.root().get_feature(reprog_controls::FEATURE_ID),
-    )
-    .await?
-    .ok_or(HostSwitchError::UnsupportedKeyboard)?;
-    let controls = ReprogControlsV4::new(Arc::clone(&channel), keyboard_index, feature.index);
+    if capture_mode == HostSwitchCaptureMode::ChangeHostAnnouncement {
+        let feature_index = resolve_change_host_feature_index(&channel, keyboard_index).await?;
+        return run_change_host_announcement_session(
+            keyboard,
+            keyboard_index,
+            feature_index,
+            shutdown,
+            channel,
+        )
+        .await;
+    }
+    let (controls, change_host_feature_index) =
+        discover_host_switch_features(&channel, keyboard_index).await?;
 
     let armed = arm_host_controls(&controls).await?;
     if armed.is_empty() {
@@ -136,13 +178,37 @@ pub async fn run_host_switch_session(
             return;
         }
         let message = v20::Message::from(raw);
-        let Some(event) =
+        if let Some(event) =
             reprog_controls::decode_full_event(&message, keyboard_index, feature_index)
-        else {
+        {
+            debug!(
+                ?event,
+                keyboard_index, feature_index, "decoded keyboard control event"
+            );
+            if let Some((request, restore_controls)) = host_control_request(&event_controls, event)
+            {
+                debug!(host = request.host, "matched host control event");
+                let _ = press_tx.send((request, restore_controls));
+            }
             return;
-        };
-        if let Some(host) = event_host(&event_controls, event) {
-            let _ = press_tx.send(host);
+        }
+        if let Some(host) = change_host_feature_index.and_then(|change_host_index| {
+            change_host_announcement(
+                &message,
+                keyboard_index,
+                change_host_index,
+                EASY_SWITCH_HOST_COUNT,
+            )
+        }) {
+            debug!(host, "matched change-host announcement");
+            let _ = press_tx.send((
+                HostSwitchRequest {
+                    host,
+                    keyboard_transition: KeyboardHostTransition::AlreadyDeparting,
+                    announcement_observed: true,
+                },
+                false,
+            ));
         }
     });
 
@@ -156,7 +222,7 @@ pub async fn run_host_switch_session(
             let reason = reason.unwrap_or(HostSwitchStopReason::DeviceLost);
             (None, reason == HostSwitchStopReason::Graceful)
         },
-        Some(host) = press_rx.recv() => (Some(host), true),
+        Some((request, restore_controls)) = press_rx.recv() => (Some(request), restore_controls),
     };
 
     drop(listener);
@@ -166,42 +232,88 @@ pub async fn run_host_switch_session(
     Ok(outcome.0)
 }
 
-/// Move reachable targets to `host`, then move the keyboard last.
-///
-/// Returns whether the keyboard actually changed hosts.
-pub async fn switch_linked_hosts(
-    keyboard: &DeviceRoute,
-    targets: &[DeviceRoute],
-    host: u8,
-    channel_pool: &ChannelPool,
-) -> Result<bool, HostSwitchError> {
-    let channel = open_channel(channel_pool, keyboard, "opening keyboard channel")
-        .await?
-        .ok_or(HostSwitchError::KeyboardNotFound)?;
-    // Validate the keyboard's own move before touching anything: preparation is
-    // read-only, but it is the step that rejects an unpaired host slot, and
-    // discovering that *after* the mice have moved would strand them on a host
-    // the keyboard never reaches. Applying it still happens last, because once
-    // the keyboard leaves this host its channel can no longer command a mouse
-    // sharing the same receiver.
-    let keyboard_change = prepare_host_change_on(&channel, keyboard.device_index(), host).await?;
-    for target in targets {
-        match prepare_host_change(target, host, keyboard, &channel, channel_pool).await {
-            Ok(change) => {
-                if let Err(error) = apply_host_change(change).await {
-                    debug!(%error, route = %target, host, "linked device host switch failed");
-                }
-            }
-            Err(error) => {
-                debug!(%error, route = %target, host, "linked device host switch preparation failed");
-            }
+async fn resolve_change_host_feature_index(
+    channel: &Arc<HidppChannel>,
+    keyboard_index: u8,
+) -> Result<u8, HostSwitchError> {
+    let device = timed_device(
+        "opening keyboard device",
+        Device::new(Arc::clone(channel), keyboard_index),
+    )
+    .await?;
+    timed_hidpp(
+        "locating change-host announcements",
+        device.root().get_feature(ChangeHostFeature::ID),
+    )
+    .await?
+    .map(|feature| feature.index)
+    .ok_or(HostSwitchError::UnsupportedKeyboard)
+}
+
+async fn discover_host_switch_features(
+    channel: &Arc<HidppChannel>,
+    keyboard_index: u8,
+) -> Result<(ReprogControlsV4, Option<u8>), HostSwitchError> {
+    let device = timed_device(
+        "opening keyboard device",
+        Device::new(Arc::clone(channel), keyboard_index),
+    )
+    .await?;
+    let feature = timed_hidpp(
+        "locating host controls",
+        device.root().get_feature(reprog_controls::FEATURE_ID),
+    )
+    .await?
+    .ok_or(HostSwitchError::UnsupportedKeyboard)?;
+    let controls = ReprogControlsV4::new(Arc::clone(channel), keyboard_index, feature.index);
+    let change_host_feature_index = match timed_hidpp(
+        "locating change-host announcements",
+        device.root().get_feature(ChangeHostFeature::ID),
+    )
+    .await
+    {
+        Ok(info) => info.map(|info| info.index),
+        Err(error) => {
+            debug!(%error, "change-host announcement lookup failed");
+            None
         }
-    }
-    let changed = apply_host_change(keyboard_change).await?;
-    if changed {
-        debug!(host, route = %keyboard, "keyboard host switched");
-    }
-    Ok(changed)
+    };
+    Ok((controls, change_host_feature_index))
+}
+
+async fn run_change_host_announcement_session(
+    keyboard: DeviceRoute,
+    keyboard_index: u8,
+    feature_index: u8,
+    shutdown: oneshot::Receiver<HostSwitchStopReason>,
+    channel: Arc<HidppChannel>,
+) -> Result<Option<HostSwitchRequest>, HostSwitchError> {
+    let (press_tx, mut press_rx) = mpsc::unbounded_channel();
+    let listener = channel.add_msg_listener_guarded(move |raw, matched| {
+        if matched {
+            return;
+        }
+        let message = v20::Message::from(raw);
+        if let Some(host) = change_host_announcement(
+            &message,
+            keyboard_index,
+            feature_index,
+            EASY_SWITCH_HOST_COUNT,
+        ) {
+            let _ = press_tx.send(HostSwitchRequest {
+                host,
+                keyboard_transition: KeyboardHostTransition::AlreadyDeparting,
+                announcement_observed: true,
+            });
+        }
+    });
+    info!(route = %keyboard, "host switch announcement link active");
+    let request = tokio::select! {
+        _ = shutdown => None,
+        request = press_rx.recv() => request,
+    };
+    drop(listener);
+    Ok(request)
 }
 
 async fn arm_host_controls(
@@ -226,7 +338,7 @@ async fn arm_host_controls_inner(
             controls.get_ctrl_id_info(index),
         )
         .await?;
-        let Some(host) = host_channel(info) else {
+        let Some(host) = reprog_controls::host_switch_channel(info) else {
             continue;
         };
         debug!(
@@ -264,7 +376,7 @@ async fn arm_host_controls_inner(
                     timed_hidpp("diverting host control", controls.divert_cid(info.cid)).await?;
                 }
                 ReportingMode::Analytics => {
-                    timed_hidpp(
+                    let echo = timed_hidpp(
                         "enabling host control analytics",
                         controls.set_cid_reporting_full(
                             info.cid,
@@ -275,6 +387,11 @@ async fn arm_host_controls_inner(
                         ),
                     )
                     .await?;
+                    debug!(
+                        cid = format_args!("{:#06x}", info.cid),
+                        ?echo,
+                        "analytics reporting enabled"
+                    );
                 }
             }
         }
@@ -324,76 +441,6 @@ fn restoration_change(control: ArmedControl) -> reprog_controls::CidReportingCha
     }
 }
 
-struct PreparedHostChange {
-    feature: Arc<ChangeHostFeature>,
-    device_index: u8,
-    host: u8,
-    required: bool,
-}
-
-async fn prepare_host_change(
-    target: &DeviceRoute,
-    host: u8,
-    keyboard: &DeviceRoute,
-    keyboard_channel: &Arc<HidppChannel>,
-    channel_pool: &ChannelPool,
-) -> Result<PreparedHostChange, HostSwitchError> {
-    if shares_channel(target, keyboard) {
-        prepare_host_change_on(keyboard_channel, target.device_index(), host).await
-    } else {
-        let channel = open_channel(channel_pool, target, "opening linked device channel")
-            .await?
-            .ok_or(HostSwitchError::TargetNotFound)?;
-        prepare_host_change_on(&channel, target.device_index(), host).await
-    }
-}
-
-async fn prepare_host_change_on(
-    channel: &Arc<HidppChannel>,
-    device_index: u8,
-    host: u8,
-) -> Result<PreparedHostChange, HostSwitchError> {
-    let mut device = timed_hidpp(
-        "opening host-change device",
-        Device::new(Arc::clone(channel), device_index),
-    )
-    .await?;
-    let info = timed_hidpp(
-        "locating host-change feature",
-        device.root().get_feature(ChangeHostFeature::ID),
-    )
-    .await?
-    .ok_or_else(|| HostSwitchError::Hidpp("ChangeHost is unsupported".into()))?;
-    let change_host = device.add_feature::<ChangeHostFeature>(info.index);
-    let state = timed_hidpp("reading current host", change_host.get_host_info()).await?;
-    let required = host_change_required(state.current_host, state.host_count, host)?;
-    if required && host_slot_is_empty(&mut device, host).await {
-        return Err(HostSwitchError::HostSlotEmpty { host });
-    }
-    Ok(PreparedHostChange {
-        feature: change_host,
-        device_index,
-        host,
-        required,
-    })
-}
-
-async fn apply_host_change(change: PreparedHostChange) -> Result<bool, HostSwitchError> {
-    if !change.required {
-        let PreparedHostChange {
-            device_index, host, ..
-        } = change;
-        debug!(device_index, host, "device already uses requested host");
-        return Ok(false);
-    }
-    timed_hidpp(
-        "writing current host",
-        change.feature.set_current_host(change.host),
-    )
-    .await?;
-    Ok(true)
-}
-
 async fn open_channel(
     channel_pool: &ChannelPool,
     route: &DeviceRoute,
@@ -418,80 +465,18 @@ where
         .map_err(|error| hidpp_error(operation, error))
 }
 
-/// Whether the device explicitly reports `host` as an empty slot.
-///
-/// `ChangeHost`'s `host_count` counts the device's RF channels, not the ones
-/// that have a pairing. Switching to an empty slot is not refused by the
-/// device: `setCurrentHost` is fire-and-forget and a successful switch usually
-/// resets the device, so it simply drops off this host and does not come back
-/// until the user pairs that slot or presses the device's own host button. A
-/// keyboard with three host keys paired to two machines is enough to hit this.
-///
-/// `HostsInfo` (`0x1815`) is the only feature that reports per-slot pairing
-/// status, and asking is advisory: a device that does not implement it, times
-/// out, returns a feature error, or answers with a status byte outside the
-/// spec has not said the slot is empty, and must still be allowed to switch.
-/// Only an explicit `Empty` refuses, so this returns a plain `bool` — an
-/// unreadable status can never abort the transition it was meant to protect.
-async fn host_slot_is_empty(device: &mut Device, host: u8) -> bool {
-    let feature = timed_hidpp(
-        "locating hosts-info feature",
-        device.root().get_feature(HostsInfoFeature::ID),
-    )
-    .await;
-    let index = match feature {
-        Ok(Some(info)) => info.index,
-        Ok(None) => return false,
-        Err(error) => {
-            debug!(host, %error, "hosts-info lookup failed; treating the slot as usable");
-            return false;
-        }
-    };
-    let hosts_info = device.add_feature::<HostsInfoFeature>(index);
-    match timed_hidpp(
-        "reading host slot status",
-        hosts_info.get_host_info(HostIndex::Slot(host)),
-    )
-    .await
-    {
-        Ok(slot) => slot.status == HostSlotStatus::Empty,
-        Err(error) => {
-            debug!(host, %error, "host slot status is unreadable; treating the slot as usable");
-            false
-        }
-    }
-}
-
-fn host_change_required(
-    current_host: u8,
-    host_count: u8,
-    requested_host: u8,
-) -> Result<bool, HostSwitchError> {
-    if requested_host >= host_count {
-        return Err(HostSwitchError::Hidpp(format!(
-            "host {requested_host} is outside device host count {host_count}"
-        )));
-    }
-    Ok(current_host != requested_host)
-}
-
-fn shares_channel(left: &DeviceRoute, right: &DeviceRoute) -> bool {
-    left.shares_transport(right)
+async fn timed_device<T>(
+    operation: &'static str,
+    future: impl Future<Output = Result<T, DeviceError>>,
+) -> Result<T, HostSwitchError> {
+    timeout(HIDPP_OPERATION_TIMEOUT, future)
+        .await
+        .map_err(|_| HostSwitchError::TimedOut { operation })?
+        .map_err(HostSwitchError::Device)
 }
 
 fn hidpp_error(operation: &'static str, error: impl std::fmt::Debug) -> HostSwitchError {
     HostSwitchError::Hidpp(format!("{operation}: {error:?}"))
-}
-
-fn host_channel(info: reprog_controls::CtrlIdInfo) -> Option<u8> {
-    HOST_CONTROL_IDS
-        .iter()
-        .find_map(|(cid, host)| (info.cid == cid.0).then_some(*host))
-        .or_else(|| {
-            HOST_TASK_IDS
-                .iter()
-                .find_map(|(task, host)| (info.task_id == task.0).then_some(*host))
-        })
 }
 
 fn event_host(
@@ -515,312 +500,45 @@ fn event_host(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use hidpp::channel::HidppChannel;
-
-    use super::{
-        ArmedControl, HostSwitchError, ReportingMode, event_host, host_change_required,
-        host_channel, prepare_host_change_on, restoration_change, shares_channel,
-    };
-    use crate::DeviceRoute;
-    use crate::channel::scripted::{ScriptedRawHidChannel, feature_error};
-    use crate::reprog_controls::{
-        AnalyticsKeyEvent, CidReporting, ControlId, CtrlIdInfo, ReprogControlsEvent,
-    };
-
-    /// Feature index the scripted keyboard reports for `0x1814 ChangeHost`.
-    const CHANGE_HOST_INDEX: u8 = 0x04;
-    /// Feature index the scripted keyboard reports for `0x1815 HostsInfo`.
-    const HOSTS_INFO_INDEX: u8 = 0x05;
-
-    /// `ErrorType::Busy`, the failure a scripted device answers with.
-    const BUSY: u8 = 0x08;
-
-    /// What the scripted keyboard's firmware does when asked about `0x1815`.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum SlotStatus {
-        /// Answers the query: hosts 0 and 1 paired, host 2 empty.
-        Reported,
-        /// Reports the feature as unimplemented, the usual index-0 lookup miss.
-        Unimplemented,
-        /// Errors on the lookup itself, as firmware that refuses unknown
-        /// feature ids rather than reporting index 0 does.
-        LookupErrors,
-        /// Implements the feature but errors on the status read.
-        ReadErrors,
-    }
-
-    /// A three-channel keyboard currently on host 0, paired on hosts 0 and 1
-    /// but **not** on host 2 — a keyboard with three host keys and only two
-    /// machines paired, which is the shape that used to strand devices.
-    fn keyboard_with_an_empty_third_slot(request: &[u8]) -> Option<Vec<u8>> {
-        scripted_keyboard(request, SlotStatus::Reported)
-    }
-
-    /// The same keyboard without `0x1815`, so its slot pairing is unknowable.
-    fn keyboard_without_hosts_info(request: &[u8]) -> Option<Vec<u8>> {
-        scripted_keyboard(request, SlotStatus::Unimplemented)
-    }
-
-    /// The same keyboard, whose firmware errors when asked for `0x1815`.
-    fn keyboard_erroring_on_hosts_info_lookup(request: &[u8]) -> Option<Vec<u8>> {
-        scripted_keyboard(request, SlotStatus::LookupErrors)
-    }
-
-    /// The same keyboard, whose `0x1815` reads come back an error.
-    fn keyboard_erroring_on_slot_status(request: &[u8]) -> Option<Vec<u8>> {
-        scripted_keyboard(request, SlotStatus::ReadErrors)
-    }
-
-    fn scripted_keyboard(request: &[u8], slot_status: SlotStatus) -> Option<Vec<u8>> {
-        if request.len() < 7 || !matches!(request[0], 0x10 | 0x11) {
-            return None;
-        }
-        let mut payload = [0u8; 16];
-        match (request[2], request[3] >> 4) {
-            // Root ping used by Device::new.
-            (0x00, 0x01) => payload[0] = 4,
-            // Root feature lookup.
-            (0x00, 0x00) => {
-                payload[0] = match u16::from_be_bytes([request[4], request[5]]) {
-                    0x1814 => CHANGE_HOST_INDEX,
-                    0x1815 => match slot_status {
-                        SlotStatus::Unimplemented => 0x00,
-                        SlotStatus::LookupErrors => return Some(feature_error(request, BUSY)),
-                        SlotStatus::Reported | SlotStatus::ReadErrors => HOSTS_INFO_INDEX,
-                    },
-                    _ => 0x00,
-                };
-            }
-            // ChangeHost getHostInfo: three RF channels, currently on host 0.
-            (CHANGE_HOST_INDEX, 0x00) => payload[..2].copy_from_slice(&[3, 0]),
-            // HostsInfo getHostInfo: echo the slot, then its pairing status.
-            (HOSTS_INFO_INDEX, 0x01) => {
-                if slot_status == SlotStatus::ReadErrors {
-                    return Some(feature_error(request, BUSY));
-                }
-                payload[0] = request[4];
-                payload[1] = u8::from(request[4] < 2);
-            }
-            _ => return None,
-        }
-
-        let mut response = vec![0u8; 7];
-        response[0] = 0x10;
-        response[1..4].copy_from_slice(&request[1..4]);
-        response[4..].copy_from_slice(&payload[..3]);
-        Some(response)
-    }
-
-    async fn scripted_channel(responder: crate::channel::scripted::Responder) -> Arc<HidppChannel> {
-        let (raw, _handle) = ScriptedRawHidChannel::with_responder(responder);
-        crate::channel::scripted::scripted_channel(raw).await
-    }
-
-    #[tokio::test]
-    async fn switching_to_an_unpaired_slot_is_refused() {
-        // ChangeHost would allow it: host 2 is within the device's channel
-        // count. But nothing is paired there, and `setCurrentHost` is
-        // fire-and-forget — the device would simply leave and not come back.
-        let channel = scripted_channel(keyboard_with_an_empty_third_slot).await;
-
-        let Err(error) = prepare_host_change_on(&channel, 1, 2).await else {
-            panic!("an unpaired slot must not be switched to");
-        };
-
-        assert!(
-            matches!(error, HostSwitchError::HostSlotEmpty { host: 2 }),
-            "got {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn switching_to_a_paired_slot_proceeds() {
-        let channel = scripted_channel(keyboard_with_an_empty_third_slot).await;
-
-        let change = prepare_host_change_on(&channel, 1, 1)
-            .await
-            .expect("a paired slot must be switchable");
-
-        assert!(change.required, "host 1 differs from the current host 0");
-    }
-
-    #[tokio::test]
-    async fn a_device_without_hosts_info_is_still_switched() {
-        // 0x1815 is the only source of per-slot pairing status. Without it the
-        // guard must not block, or this change would regress every device that
-        // does not implement it.
-        let channel = scripted_channel(keyboard_without_hosts_info).await;
-
-        let change = prepare_host_change_on(&channel, 1, 2)
-            .await
-            .expect("a device that cannot report slot status must still switch");
-
-        assert!(change.required);
-    }
-
-    #[tokio::test]
-    async fn a_failed_hosts_info_lookup_does_not_block_the_switch() {
-        // Firmware that answers an unknown feature id with an error rather than
-        // index 0 must read the same as not implementing 0x1815 at all: the
-        // pairing status is unknowable, which is not a reason to refuse.
-        let channel = scripted_channel(keyboard_erroring_on_hosts_info_lookup).await;
-
-        let change = prepare_host_change_on(&channel, 1, 2)
-            .await
-            .expect("an errored feature lookup must not abort the switch");
-
-        assert!(change.required);
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_slot_status_does_not_block_the_switch() {
-        // The guard is advisory. A device that has 0x1815 but cannot answer for
-        // it right now has not said the slot is empty, so refusing here would
-        // turn a transient read failure into a dead host key.
-        let channel = scripted_channel(keyboard_erroring_on_slot_status).await;
-
-        let change = prepare_host_change_on(&channel, 1, 2)
-            .await
-            .expect("an errored status read must not abort the switch");
-
-        assert!(change.required);
-    }
-
-    #[tokio::test]
-    async fn a_switch_to_the_current_host_never_consults_slot_status() {
-        // Already-there is decided before the pairing check, so a device on an
-        // unpaired-looking slot is not blocked from staying put.
-        let channel = scripted_channel(keyboard_with_an_empty_third_slot).await;
-
-        let change = prepare_host_change_on(&channel, 1, 0)
-            .await
-            .expect("staying on the current host is always fine");
-
-        assert!(!change.required);
-    }
-
-    /// A reporting snapshot with unrelated bits deliberately set, so the
-    /// cleanup tests prove that only the bits they vary are restored.
-    fn noisy_reporting() -> CidReporting {
-        CidReporting {
-            cid: ControlId(0x00d3),
-            diverted: false,
-            persistently_diverted: true,
-            force_raw_xy: true,
-            raw_xy: false,
-            remap: Some(ControlId(0x1234)),
-            analytics_key_events: false,
-            raw_wheel: true,
-        }
-    }
-
-    #[test]
-    fn receiver_slots_share_one_channel() {
-        let keyboard = DeviceRoute::Bolt {
-            receiver_uid: "AABB".into(),
-            slot: 1,
-        };
-        let mouse = DeviceRoute::Bolt {
-            receiver_uid: "aabb".into(),
-            slot: 2,
-        };
-        assert!(shares_channel(&keyboard, &mouse));
-    }
-
-    #[test]
-    fn direct_devices_do_not_share_channels() {
-        let route = DeviceRoute::Direct {
-            vendor_id: 0x046d,
-            product_id: 0xb025,
-        };
-        assert!(!shares_channel(&route, &route));
-    }
-
-    #[test]
-    fn host_controls_are_recognized_by_task_when_cid_varies() {
-        let info = CtrlIdInfo {
-            cid: 0x1234,
-            task_id: 0x00af,
-            flags: 0,
-        };
-        assert_eq!(host_channel(info), Some(1));
-    }
-
-    #[test]
-    fn analytics_event_selects_the_matching_host() {
-        let controls = [ArmedControl {
-            cid: 0x00d3,
-            host: 2,
-            mode: ReportingMode::Analytics,
-            original: noisy_reporting(),
-        }];
-        let mut events = [AnalyticsKeyEvent::default(); 5];
-        events[0] = AnalyticsKeyEvent {
-            cid: ControlId(0x00d3),
-            event: 1,
-        };
-        assert_eq!(
-            event_host(&controls, ReprogControlsEvent::AnalyticsKeyEvents(events)),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn current_host_does_not_require_a_change() {
-        assert!(matches!(host_change_required(1, 3, 1), Ok(false)));
-    }
-
-    #[test]
-    fn different_valid_host_requires_a_change() {
-        assert!(matches!(host_change_required(0, 3, 2), Ok(true)));
-    }
-
-    #[test]
-    fn host_outside_device_range_is_rejected() {
-        assert!(
-            host_change_required(0, 2, 2).is_err(),
-            "host 2 is outside a device that reports 2 hosts and must be rejected"
-        );
-    }
-
-    #[test]
-    fn diverted_cleanup_restores_only_the_original_temporary_bits() {
-        let change = restoration_change(ArmedControl {
-            cid: 0x00d3,
-            host: 2,
-            mode: ReportingMode::Diverted,
-            original: CidReporting {
-                diverted: true,
-                raw_xy: true,
-                ..noisy_reporting()
-            },
-        });
-
-        assert_eq!(change.diverted, Some(true));
-        assert_eq!(change.raw_xy, Some(true));
-        assert_eq!(change.analytics_key_events, None);
-        assert_eq!(change.persistently_diverted, None);
-        assert_eq!(change.remap, None);
-    }
-
-    #[test]
-    fn analytics_cleanup_restores_the_original_analytics_bit() {
-        let change = restoration_change(ArmedControl {
-            cid: 0x00d3,
-            host: 2,
-            mode: ReportingMode::Analytics,
-            original: CidReporting {
-                analytics_key_events: true,
-                ..noisy_reporting()
-            },
-        });
-
-        assert_eq!(change.analytics_key_events, Some(true));
-        assert_eq!(change.diverted, None);
-        assert_eq!(change.raw_xy, None);
-    }
+fn host_control_request(
+    controls: &[ArmedControl],
+    event: reprog_controls::ReprogControlsEvent,
+) -> Option<(HostSwitchRequest, bool)> {
+    let host = event_host(controls, event)?;
+    let restore_controls = controls
+        .iter()
+        .any(|control| control.host == host && matches!(control.mode, ReportingMode::Diverted));
+    Some((
+        HostSwitchRequest {
+            host,
+            keyboard_transition: KeyboardHostTransition::CommandRequired,
+            announcement_observed: false,
+        },
+        restore_controls,
+    ))
 }
+
+/// Decode a keyboard's `0x1814` host-change announcement.
+///
+/// Some analytics-only keyboards announce the physical Easy-Switch press on
+/// ChangeHost function 0 instead of emitting a ReprogControls analytics event.
+fn change_host_announcement(
+    message: &v20::Message,
+    device_index: u8,
+    feature_index: u8,
+    host_count: u8,
+) -> Option<u8> {
+    let header = message.header();
+    if header.device_index != device_index
+        || header.feature_index != feature_index
+        || header.function_id.to_lo() != 0
+        || header.software_id.to_lo() != 0
+    {
+        return None;
+    }
+    let target_host = message.extend_payload()[1];
+    (target_host < host_count).then_some(target_host)
+}
+
+#[cfg(test)]
+mod tests;
