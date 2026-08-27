@@ -116,6 +116,7 @@ pub(super) fn detail_content(
         }
         DetailTab::ActionsRing => action_ring_tab(panels.action_ring).into_any_element(),
         DetailTab::Keys => keys_tab(panels.keyboard_model).into_any_element(),
+        DetailTab::EasySwitch => easy_switch_tab(cx).into_any_element(),
         DetailTab::Pointer => {
             pointer_tab(panels.dpi_panel, panels.smartshift_panel, cx).into_any_element()
         }
@@ -236,6 +237,7 @@ fn detail_tab_icon(tab: DetailTab) -> &'static str {
         DetailTab::Buttons => "action-icons/mouse-pointer-click.svg",
         DetailTab::ActionsRing => "action-icons/layout-grid.svg",
         DetailTab::Keys => "action-icons/keyboard.svg",
+        DetailTab::EasySwitch => "action-icons/refresh-cw.svg",
         DetailTab::Pointer => "action-icons/gauge.svg",
         DetailTab::Lighting | DetailTab::Light => "action-icons/palette.svg",
         DetailTab::Camera => "action-icons/camera.svg",
@@ -276,6 +278,95 @@ fn tab_body(
 /// Keys tab: the function-row remapper for a keyboard.
 fn keys_tab(keyboard_model: &gpui::Entity<FunctionRowView>) -> impl IntoElement {
     tab_body(ContentWidth::DoubleExtraLarge, keyboard_model.clone()).justify_center()
+}
+
+/// Easy-Switch tab: choose which devices follow this keyboard's physical host
+/// keys.
+fn easy_switch_tab(cx: &mut Context<AppView>) -> impl IntoElement {
+    let pal = theme::palette(cx);
+    let targets =
+        AppState::try_read(cx).map_or_else(Vec::new, AppState::host_switch_target_devices);
+    let target_rows = targets.into_iter().map(|target| {
+        let target_key = target.config_key.clone();
+        h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_4()
+            .py_2()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_3()
+                    .child(status_badge(target.online, pal))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().text_body().truncate().child(target.display_name))
+                            .child(
+                                div()
+                                    .text_caption()
+                                    .text_color(pal.text_muted)
+                                    .child(kind_label(target.kind)),
+                            ),
+                    ),
+            )
+            .child(
+                Toggle::new(format!("easy-switch-target-{}", target.config_key))
+                    .selected(target.selected)
+                    .on_change(move |enabled, _window, cx| {
+                        AppState::update(cx, |state, cx| {
+                            if let Some(key) =
+                                state.set_host_switch_target_enabled(&target_key, *enabled)
+                            {
+                                cx.emit(StateEvent::DeviceConfigChanged(key));
+                            }
+                        });
+                    }),
+            )
+    });
+    let has_targets = target_rows.len() > 0;
+
+    tab_body(
+        ContentWidth::Medium,
+        v_flex()
+            .w_full()
+            .gap_4()
+            .child(PanelCard::new(
+                tr!("Linked devices"),
+                Icon::empty().path("action-icons/refresh-cw.svg"),
+                v_flex()
+                    .gap_3()
+                    .child(
+                        div().text_body().child(tr!(
+                            "Press a host key on this keyboard to move selected devices to the same channel."
+                        )),
+                    )
+                    .when(!has_targets, |this| {
+                        this.child(
+                            div()
+                                .text_caption()
+                                .text_color(pal.text_muted)
+                                .child(tr!("No compatible Easy-Switch devices found.")),
+                        )
+                    })
+                    .children(target_rows),
+            ))
+            .child(PanelCard::new(
+                tr!("Before switching"),
+                Icon::new(IconName::Info),
+                v_flex()
+                    .gap_2()
+                    .text_caption()
+                    .text_color(pal.text_muted)
+                    .child(tr!(
+                        "Pair every linked device with the matching Easy-Switch channel on each computer."
+                    ))
+                    .child(tr!(
+                        "Enable the same links in OpenLogi on every computer that can start a switch."
+                    )),
+            )),
+    )
 }
 
 fn action_ring_tab(panel: &gpui::Entity<ActionRingPanel>) -> impl IntoElement {

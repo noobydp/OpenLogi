@@ -549,6 +549,8 @@ fn bolt_inventory(mouse_battery: BatteryInfo) -> DeviceInventory {
                     thumbwheel: true,
                     haptic_feedback: true,
                     haptic_panel: true,
+                    host_switching: true,
+                    host_switch_controls: false,
                 }),
             },
             PairedDevice {
@@ -588,7 +590,7 @@ fn bolt_inventory(mouse_battery: BatteryInfo) -> DeviceInventory {
                     extended_model_id: 0,
                 }),
                 capabilities: Some(Capabilities {
-                    buttons: false,
+                    buttons: true,
                     pointer: false,
                     lighting: true,
                     scroll_inversion: false,
@@ -596,6 +598,8 @@ fn bolt_inventory(mouse_battery: BatteryInfo) -> DeviceInventory {
                     thumbwheel: false,
                     haptic_feedback: false,
                     haptic_panel: false,
+                    host_switching: true,
+                    host_switch_controls: true,
                 }),
             },
         ],
@@ -645,6 +649,8 @@ fn direct_inventory() -> DeviceInventory {
                 thumbwheel: false,
                 haptic_feedback: false,
                 haptic_panel: false,
+                host_switching: false,
+                host_switch_controls: false,
             }),
         }],
     }
