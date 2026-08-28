@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use openlogi_assets::http::safe_component_path;
 use openlogi_assets::{
-    BUTTONS_RENDER_FILES, DeviceEntry, FRONT_RENDER_FILES, Index, METADATA_FILES, Metadata,
+    BUTTONS_RENDER_FILES, DepotManifest, DeviceEntry, FRONT_RENDER_FILES, Index, METADATA_FILES,
+    Metadata,
 };
 use openlogi_core::device::{DeviceKind, DeviceModelInfo};
 use tracing::{debug, warn};
@@ -225,13 +226,6 @@ impl AssetResolver {
                 );
                 continue;
             };
-            // Hotspot metadata in whichever schema this depot cached:
-            // `core_metadata.json` (newer) or `metadata.json` (older).
-            let Some(&meta_name) = METADATA_FILES.iter().find(|n| dir.join(n).exists()) else {
-                continue;
-            };
-            let meta_path = dir.join(meta_name);
-
             // Pick the colour variant matching this device's HID++
             // extended_model_id byte. Logi calibrates the assignment
             // markers against the *buttons* image (typically
@@ -286,13 +280,7 @@ impl AssetResolver {
                 continue;
             };
 
-            let metadata = match Metadata::load_from(&meta_path) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(depot, root = %root.display(), file = meta_name, error = ?e, "device metadata unparseable — rendering image without hotspots");
-                    Metadata::default()
-                }
-            };
+            let metadata = load_metadata(&dir, manifest.as_ref(), entry, model, depot, root);
             let (png_width, png_height) = match read_png_dimensions(&image_path) {
                 Ok(dims) => dims,
                 Err(e) => {
@@ -390,6 +378,41 @@ impl AssetResolver {
         }
         debug!(depot, "standalone asset cache miss across all roots");
         None
+    }
+}
+
+/// Load optional hotspot metadata for a device render.
+///
+/// Most depots use a conventional filename, while camera depots map a
+/// model-specific name such as `metadata_085c.json` through the manifest.
+/// Missing metadata must not hide an otherwise valid product image.
+fn load_metadata(
+    dir: &Path,
+    manifest: Option<&DepotManifest>,
+    entry: &DeviceEntry,
+    model: &DeviceModelInfo,
+    depot: &str,
+    root: &Path,
+) -> Metadata {
+    let variant_name = manifest.and_then(|manifest| {
+        entry.model_id_candidates().find_map(|base| {
+            manifest.resource_for_variant(base, model.extended_model_id, "image_metadata")
+        })
+    });
+    let Some(path) = variant_name
+        .into_iter()
+        .chain(METADATA_FILES)
+        .filter_map(|name| safe_component_path(dir, name, "asset file").ok())
+        .find(|path| path.exists())
+    else {
+        return Metadata::default();
+    };
+    match Metadata::load_from(&path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            warn!(depot, root = %root.display(), file = %path.display(), error = ?e, "device metadata unparseable — rendering image without hotspots");
+            Metadata::default()
+        }
     }
 }
 
@@ -622,6 +645,66 @@ mod tests {
         );
         assert_eq!((asset.png_width, asset.png_height), (100, 200));
         assert_eq!(asset.metadata.assignments().count(), 1);
+    }
+
+    /// Camera depots may use a manifest-mapped `image_metadata` filename
+    /// rather than either conventional hotspot-metadata name. The hero render
+    /// must work before that optional file lands, then consume it when present.
+    #[test]
+    fn resolves_c922_render_with_optional_manifest_metadata() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let depot = "c922";
+        let dir = root.path().join(depot);
+        std::fs::create_dir_all(&dir).expect("create depot dir");
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"devices":[{"modelId":"085c","resources":[{"key":"device_camera_image","src":"front.png"},{"key":"image_metadata","src":"metadata_085c.json"}]}]}"#,
+        )
+        .expect("write manifest");
+        std::fs::write(dir.join("front.png"), png_header(1280, 582)).expect("write front");
+        let resolver = AssetResolver {
+            read_roots: vec![root.path().to_path_buf()],
+            write_root: root.path().to_path_buf(),
+            has_bundle: false,
+            index: None,
+        };
+        let entry = DeviceEntry {
+            model_id: "085c".to_string(),
+            model_ids: vec!["0883".into(), "0894".into(), "085c".into()],
+            display_name: "C922".to_string(),
+            kind: "CAMERA".to_string(),
+            asset_path: "v1/devices/c922/".to_string(),
+            files: Vec::new(),
+        };
+        let model = DeviceModelInfo {
+            model_ids: [0x085c, 0, 0],
+            ..bare_model()
+        };
+
+        let asset = resolver
+            .load_files(depot, &entry, &model)
+            .expect("C922 render should resolve without conventional metadata");
+        assert_eq!(asset.kind, Some(DeviceKind::Camera));
+        assert_eq!(asset.image_path, dir.join("front.png"));
+        assert_eq!(asset.hero_image_path, Some(dir.join("front.png")));
+        assert_eq!((asset.png_width, asset.png_height), (1280, 582));
+        assert_eq!(asset.metadata, Metadata::default());
+
+        std::fs::write(
+            dir.join("metadata_085c.json"),
+            r#"{"images":[{"key":"device_image","origin":{"width":1280,"height":800}},{"key":"device_camera_image","origin":{"width":396,"height":396}}]}"#,
+        )
+        .expect("write camera metadata");
+        let asset = resolver
+            .load_files(depot, &entry, &model)
+            .expect("C922 render should resolve with manifest metadata");
+        assert_eq!(
+            asset
+                .metadata
+                .origin()
+                .map(|origin| (origin.width, origin.height)),
+            Some((1280, 800))
+        );
     }
 
     #[test]

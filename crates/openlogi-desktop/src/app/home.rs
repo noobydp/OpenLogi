@@ -559,8 +559,8 @@ fn device_image(
     {
         return img(path).max_w_full().max_h_full().into_any_element();
     }
-    // Cameras carry no depot asset, so give them a recognisable glyph on their
-    // gallery card instead of the generic chip fallback.
+    // A camera whose depot carries no usable render still gets a recognisable
+    // glyph on its gallery card instead of the generic chip fallback.
     let icon = if matches!(record.kind, DeviceKind::Camera) {
         IconName::Eye
     } else {
