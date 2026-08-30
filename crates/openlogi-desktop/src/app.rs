@@ -25,7 +25,7 @@ use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
 use crate::features::profiles::{AppCatalogPicker, ProfileIconCache};
 use crate::services::assets::AssetResolver;
-use crate::state::{AgentLink, AppState, DeviceRecord, StateEvent};
+use crate::state::{AgentLink, AppState, DeviceKey, DeviceRecord, StateEvent};
 use crate::ui::theme::{self, ContentWidth, Typography as _};
 
 pub(crate) mod deeplink;
@@ -39,6 +39,7 @@ mod widgets;
 // gallery card, so it reaches these through the crate-stable `crate::app::…`
 // path rather than the internal `app::home` submodule.
 pub(crate) use home::{glow_canvas, keyboard_glow};
+pub(crate) use widgets::{kind_label, status_badge};
 /// Which screen the root view is showing.
 ///
 /// GPUI has no router, so navigation is a tiny view-local enum that selects
@@ -75,6 +76,8 @@ enum DetailTab {
     ActionsRing,
     /// The keyboard function-row remapper with clickable F-key bubbles.
     Keys,
+    /// Keyboard-initiated Easy-Switch follower configuration.
+    EasySwitch,
     /// Pointer tuning — DPI and presets.
     Pointer,
     /// RGB lighting — color, brightness, on/off.
@@ -124,6 +127,9 @@ impl DetailTab {
         if matches!(record.kind, DeviceKind::Keyboard) && caps.buttons {
             tabs.push(Self::Keys);
         }
+        if caps.host_switch_controls {
+            tabs.push(Self::EasySwitch);
+        }
         if caps.pointer {
             tabs.push(Self::Pointer);
         }
@@ -150,6 +156,7 @@ impl DetailTab {
             Self::Buttons => tr!("Buttons"),
             Self::ActionsRing => tr!("Actions Ring"),
             Self::Keys => tr!("Keys"),
+            Self::EasySwitch => tr!("Easy-Switch"),
             Self::Pointer => tr!("Pointer"),
             Self::Lighting | Self::Light => tr!("Lighting"),
             Self::Camera => tr!("Camera"),
@@ -263,11 +270,12 @@ impl AppView {
                     on_home
                         || (view.active_tab == DetailTab::Light && active_key.as_ref() == Some(key))
                 }
-                StateEvent::DeviceConfigChanged(key) => {
-                    on_home
-                        || (matches!(view.active_tab, DetailTab::Pointer | DetailTab::Device)
-                            && active_key.as_ref() == Some(key))
-                }
+                StateEvent::DeviceConfigChanged(key) => device_config_change_is_visible(
+                    on_home,
+                    view.active_tab,
+                    active_key.as_ref(),
+                    key,
+                ),
                 StateEvent::CameraChanged => on_home || view.active_tab == DetailTab::Light,
                 // Child entities own these surfaces and subscribe directly. A
                 // language switch already refreshes every window, and the root
@@ -441,6 +449,19 @@ impl AppView {
                     })),
             )
     }
+}
+
+fn device_config_change_is_visible(
+    on_home: bool,
+    active_tab: DetailTab,
+    active_key: Option<&DeviceKey>,
+    changed_key: &DeviceKey,
+) -> bool {
+    on_home
+        || (matches!(
+            active_tab,
+            DetailTab::Pointer | DetailTab::EasySwitch | DetailTab::Device
+        ) && active_key == Some(changed_key))
 }
 
 fn request_accessibility(cx: &mut App) {
@@ -651,7 +672,10 @@ impl Render for AppView {
 #[cfg(test)]
 mod tests {
     use super::home::{connection_icon_path, ordered_device_indices};
-    use super::{Capabilities, DetailTab, DeviceKind, DeviceRecord};
+    use super::{
+        Capabilities, DetailTab, DeviceKey, DeviceKind, DeviceRecord,
+        device_config_change_is_visible,
+    };
     use crate::ui::battery::{battery_charging_no_reading, battery_needs_attention};
     use openlogi_core::device::{
         BatteryInfo, BatteryLevel, BatteryStatus, DeviceTransports, LightCapabilities,
@@ -839,6 +863,8 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            host_switching: false,
+            host_switch_controls: false,
         });
         // After 0x0005 kind-correction the record has kind=Mouse, not Keyboard.
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Mouse, caps));
@@ -861,6 +887,8 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            host_switching: false,
+            host_switch_controls: false,
         });
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
         assert!(
@@ -881,10 +909,42 @@ mod tests {
             thumbwheel: false,
             haptic_feedback: false,
             haptic_panel: false,
+            host_switching: false,
+            host_switch_controls: false,
         });
         let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
         assert!(tabs.contains(&DetailTab::Keys));
         assert!(!tabs.contains(&DetailTab::Buttons));
+    }
+
+    #[test]
+    fn host_switching_keyboard_shows_easy_switch_tab() {
+        let caps = Some(Capabilities {
+            host_switching: true,
+            host_switch_controls: true,
+            ..Capabilities::default()
+        });
+        let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
+        assert!(tabs.contains(&DetailTab::EasySwitch));
+    }
+
+    #[test]
+    fn easy_switch_config_changes_refresh_the_selected_toggle() {
+        let active = DeviceKey::from("keyboard-a");
+        let other = DeviceKey::from("keyboard-b");
+
+        assert!(device_config_change_is_visible(
+            false,
+            DetailTab::EasySwitch,
+            Some(&active),
+            &active,
+        ));
+        assert!(!device_config_change_is_visible(
+            false,
+            DetailTab::EasySwitch,
+            Some(&active),
+            &other,
+        ));
     }
 
     /// Each panel is independent: a lighting-only device (e.g. a keyboard with
